@@ -26,6 +26,7 @@ class Client:
     def get(self, url, params=None, headers=None):
         if params:
             url += '?' + urllib.parse.urlencode(params)
+        last_error = 'unknown provider failure'
         for attempt in range(5):
             try:
                 request = urllib.request.Request(url, headers=headers or {})
@@ -34,12 +35,19 @@ class Client:
             except urllib.error.HTTPError as exc:
                 if exc.code not in (429, 500, 502, 503, 504):
                     raise DataError(f'HTTP {exc.code} from data provider') from None
-                wait = min(60, max(2 ** (attempt + 1), int(exc.headers.get('Retry-After', '0'))))
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+                last_error = f'HTTP {exc.code}'
+                try:
+                    retry_after = int(exc.headers.get('Retry-After', '0'))
+                except (TypeError, ValueError):
+                    retry_after = 0
+                wait = min(60, max(2 ** (attempt + 1), retry_after))
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+                last_error = ('Invalid JSON response' if isinstance(exc, json.JSONDecodeError)
+                              else 'Network connection failure or timeout')
                 wait = 2 ** (attempt + 1)
             if attempt < 4:
                 time.sleep(wait)
-        raise DataError('Data provider unavailable after five attempts')
+        raise DataError(f'Data provider unavailable after five attempts: {last_error}')
 
     def write(self, url, payload, headers):
         # Never retry writes: a timeout may mean the server accepted the request.
@@ -96,6 +104,8 @@ class MarketData:
         self.last_cg = 0.0
         self.binance_pairs = None
         self.kraken_pairs = None
+        self.okx_pairs = None
+        self.kucoin_pairs = None
 
     def cg(self, path, params):
         delay = 2.2 - (time.monotonic() - self.last_cg)
@@ -116,14 +126,19 @@ class MarketData:
     def candles(self, coin, now):
         # CoinGecko coin-ID tickers identify the asset; never guess from its symbol.
         tickers = self.cg('coins/' + urllib.parse.quote(coin['id'], safe='') + '/tickers',
-                        {'order': 'volume_desc', 'page': 1, 'exchange_ids': 'binance,kraken'})['tickers']
+                          {'order': 'volume_desc', 'page': 1, 'exchange_ids': 'binance,kraken,okex,kucoin'})['tickers']
         candidates = [t for t in tickers if t.get('coin_id') == coin['id']
                       and not t.get('is_anomaly') and not t.get('is_stale')
-                      and t['market']['identifier'] in ('binance', 'kraken')
+                      and t['market']['identifier'] in ('binance', 'kraken', 'okex', 'kucoin')
                       and t['target'] in ('USD', 'USDT', 'USDC')]
         candidates.sort(key=lambda t: float(t.get('converted_volume', {}).get('usd') or 0), reverse=True)
         errors = []
-        for t in candidates[:8]:
+        # Round-robin exchanges so one venue cannot exhaust all fallback attempts.
+        groups = {}
+        for t in candidates:
+            groups.setdefault(t['market']['identifier'], []).append(t)
+        attempts = [group[i] for i in range(3) for group in groups.values() if len(group) > i]
+        for t in attempts:
             try:
                 exchange = t['market']['identifier']
                 base, quote = t['base'], t['target']
@@ -135,11 +150,11 @@ class MarketData:
                                               and p.get('isSpotTradingAllowed', True)}
                     pair = self.binance_pairs.get((base, quote))
                     if not pair:
-                        continue
+                        raise DataError('Market absent from active spot catalogue')
                     raw = self.client.get('https://api.binance.com/api/v3/klines',
                                           {'symbol': pair, 'interval': '1d', 'limit': 400})
                     rows = [[int(r[0]) // 1000, *r[1:6]] for r in raw]
-                else:
+                elif exchange == 'kraken':
                     if self.kraken_pairs is None:
                         result = self.client.get('https://api.kraken.com/0/public/AssetPairs')
                         if result.get('error'):
@@ -148,18 +163,67 @@ class MarketData:
                     aliases = {'BTC': 'XBT', 'DOGE': 'XDG'}
                     pair = self.kraken_pairs.get(f'{aliases.get(base, base)}/{quote}')
                     if not pair:
-                        continue
+                        raise DataError('Market absent from active spot catalogue')
                     raw = self.client.get('https://api.kraken.com/0/public/OHLC',
                                           {'pair': pair, 'interval': 1440})
                     if raw.get('error'):
                         raise DataError('Kraken OHLC request failed')
                     series = [v for k, v in raw['result'].items() if k != 'last']
                     rows = [[r[0], *r[1:5], r[6]] for r in series[0]]
+                elif exchange == 'okex':
+                    if self.okx_pairs is None:
+                        raw = self.client.get('https://www.okx.com/api/v5/public/instruments', {'instType': 'SPOT'})
+                        if raw.get('code') != '0':
+                            raise DataError('OKX spot catalogue rejected request')
+                        self.okx_pairs = {(p['baseCcy'], p['quoteCcy']): p['instId']
+                                          for p in raw['data'] if p['state'] == 'live'}
+                    pair = self.okx_pairs.get((base, quote))
+                    if not pair:
+                        raise DataError('Market absent from active spot catalogue')
+                    rows = []
+                    cursor = None
+                    for _ in range(5):
+                        params = {'instId': pair, 'bar': '1Dutc', 'limit': 100}
+                        if cursor is not None:
+                            params['after'] = cursor
+                        raw = self.client.get('https://www.okx.com/api/v5/market/history-candles', params)
+                        if raw.get('code') != '0':
+                            raise DataError('OKX historical candles rejected request')
+                        batch = raw['data']
+                        if not batch:
+                            break
+                        # confirm=1 means the exchange considers this candle complete.
+                        rows.extend([[int(r[0]) // 1000, *r[1:6]] for r in batch if str(r[8]) == '1'])
+                        oldest = min(int(r[0]) for r in batch)
+                        if cursor is not None and oldest >= cursor:
+                            raise DataError('OKX pagination did not advance')
+                        cursor = oldest
+                        if len(rows) >= 400:
+                            break
+                elif exchange == 'kucoin':
+                    if self.kucoin_pairs is None:
+                        raw = self.client.get('https://api.kucoin.com/api/v2/symbols')
+                        if raw.get('code') != '200000':
+                            raise DataError('KuCoin spot catalogue rejected request')
+                        self.kucoin_pairs = {(p['baseCurrency'], p['quoteCurrency']): p['symbol']
+                                             for p in raw['data'] if p['enableTrading']}
+                    pair = self.kucoin_pairs.get((base, quote))
+                    if not pair:
+                        raise DataError('Market absent from active spot catalogue')
+                    end = int(now.timestamp()) // DAY * DAY
+                    raw = self.client.get('https://api.kucoin.com/api/v1/market/candles',
+                                          {'symbol': pair, 'type': '1day', 'startAt': end-401*DAY,
+                                           'endAt': end})
+                    if raw.get('code') != '200000':
+                        raise DataError('KuCoin historical candles rejected request')
+                    # KuCoin uses [time, open, close, high, low, volume, turnover].
+                    rows = [[int(r[0]), r[1], r[3], r[4], r[2], r[5]] for r in raw['data']]
                 return closed_candles(rows, now), f'{exchange}:{pair}'
             except (DataError, KeyError, IndexError, TypeError, ValueError) as exc:
-                errors.append(type(exc).__name__)
+                detail = str(exc) if isinstance(exc, DataError) else 'Malformed provider response: ' + type(exc).__name__
+                errors.append(f'{exchange}:{base}/{quote}: {detail}')
         raise DataError('No verified USD/USDT/USDC market with valid 1D history' +
-                        (f' ({", ".join(errors)})' if errors else ''))
+                        (f' ({"; ".join(errors)})' if errors else ': no verified non-stale CoinGecko ticker on supported exchanges'))
 
 def ema(values, period):
     if len(values) < period:
