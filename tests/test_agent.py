@@ -104,8 +104,9 @@ class Sources(unittest.TestCase):
         client.get.side_effect=[{'symbols':[{'baseAsset':'BTC','quoteAsset':'USDT','symbol':'BTCUSDT','status':'TRADING'}]},raw]
         d=agent.MarketData(client)
         t={'coin_id':'bitcoin','market':{'identifier':'binance'},'base':'BTC','target':'USDT'}
-        with patch.object(d,'cg',return_value={'tickers':[t]}):
+        with patch.object(d,'cg',return_value={'tickers':[t]}) as cg:
             candles,source=d.candles({'id':'bitcoin'},NOW)
+            self.assertEqual(cg.call_args.args[1]['exchange_ids'], 'binance,kraken,okex,kucoin')
         self.assertEqual(source,'binance:BTCUSDT')
         self.assertEqual(candles[-1].volume,100)
     def test_kraken_fallback(self):
