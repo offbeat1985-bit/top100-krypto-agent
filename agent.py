@@ -116,7 +116,7 @@ class MarketData:
     def candles(self, coin, now):
         # CoinGecko coin-ID tickers identify the asset; never guess from its symbol.
         tickers = self.cg('coins/' + urllib.parse.quote(coin['id'], safe='') + '/tickers',
-                          {'order': 'volume_desc', 'page': 1})['tickers']
+                        {'order': 'volume_desc', 'page': 1, 'exchange_ids': 'binance,kraken'})['tickers']
         candidates = [t for t in tickers if t.get('coin_id') == coin['id']
                       and not t.get('is_anomaly') and not t.get('is_stale')
                       and t['market']['identifier'] in ('binance', 'kraken')
