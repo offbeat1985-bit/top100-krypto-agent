@@ -53,14 +53,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-            - name: Restore data cache
+      - name: Restore data cache
         uses: actions/cache/restore@v4
         with:
           path: .cache/crypto4h-v1
           key: crypto4h-v1-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             crypto4h-v1-${{ github.ref_name }}-
-            - name: Automated tests
+      - name: Automated tests
         run: python -m unittest discover -s tests -v
       - name: Analyse completed daily candles
         env:
@@ -76,13 +76,13 @@ jobs:
           else
             python agent.py
           fi
-            - name: Save data cache
+      - name: Save data cache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: .cache/crypto4h-v1
           key: crypto4h-v1-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
-          - name: Upload scan report
+      - name: Upload scan report
         if: always()
         uses: actions/upload-artifact@v4
         with:
