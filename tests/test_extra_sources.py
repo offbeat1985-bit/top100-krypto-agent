@@ -1,12 +1,12 @@
 import unittest
 from unittest.mock import MagicMock,patch
 import agent
-from test_agent import rows,NOW,CUTOFF
+from test_agent import rows,NOW,CUTOFF,CachedTestCase
 
 def ticker(exchange):
     return {'coin_id':'bitcoin','market':{'identifier':exchange},'base':'BTC','target':'USDT'}
 
-class ExtraSources(unittest.TestCase):
+class ExtraSources(CachedTestCase):
     def test_kucoin_ohlcv_order_and_open_exclusion(self):
         client=MagicMock()
         r=rows()+[[CUTOFF,400,500,300,450,999]]
@@ -21,7 +21,7 @@ class ExtraSources(unittest.TestCase):
         self.assertEqual(candles[-1].close,400)
         self.assertEqual(candles[-1].high,401)
         self.assertEqual(candles[-1].volume,100)
-        self.assertEqual(client.get.call_args.args[1]['type'],'1day')
+        self.assertEqual(client.get.call_args.args[1]['type'],'4hour')
     def test_okx_utc_pagination_confirmation_and_volume(self):
         client=MagicMock()
         series=[[x[0]*1000,*x[1:6],999,999,'1'] for x in reversed(rows())]
@@ -33,7 +33,7 @@ class ExtraSources(unittest.TestCase):
             candles,source=d.candles({'id':'bitcoin'},NOW)
         self.assertEqual(source,'okex:BTC-USDT');self.assertEqual(len(candles),300)
         self.assertEqual(candles[-1].volume,100)
-        for call in client.get.call_args_list[1:]: self.assertEqual(call.args[1]['bar'],'1Dutc')
+        for call in client.get.call_args_list[1:]: self.assertEqual(call.args[1]['bar'],'4H')
         self.assertEqual(client.get.call_args_list[2].args[1]['after'],min(x[0] for x in series[:100]))
     def test_detailed_insufficient_history(self):
         client=MagicMock()
