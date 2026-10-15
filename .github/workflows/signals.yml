@@ -76,7 +76,13 @@ jobs:
           else
             python agent.py
           fi
-      - name: Upload scan report
+            - name: Save data cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/crypto4h-v1
+          key: crypto4h-v1-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          - name: Upload scan report
         if: always()
         uses: actions/upload-artifact@v4
         with:
