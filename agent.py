@@ -1,10 +1,13 @@
-"""Daily, read-only spot-market analysis. No trading endpoints are implemented."""
+"""Four-hour, read-only spot-market analysis. No trading endpoints are implemented."""
 from __future__ import annotations
 import argparse
 import base64
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 import json
+import hashlib
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import math
 import os
 from pathlib import Path
@@ -13,26 +16,92 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from zoneinfo import ZoneInfo
 
 UTC = timezone.utc
 DAY = 86400
+BAR = 4 * 3600
+TIMEFRAME = '4h'
 THRESHOLD = 75
 
 class DataError(Exception):
     pass
 
+class JsonCache:
+    """Non-secret, disposable cache; corrupt entries are treated as misses."""
+    def __init__(self, directory=None):
+        self.directory = Path(directory or os.getenv('AGENT_CACHE_DIR', '.cache/crypto4h-v1'))
+        self.lock = threading.RLock()
+
+    def path(self, key):
+        return self.directory / (hashlib.sha256(key.encode()).hexdigest() + '.json')
+
+    def get(self, key, ttl):
+        with self.lock:
+            try:
+                payload = json.loads(self.path(key).read_text())
+                if 0 <= time.time() - payload['saved'] < ttl:
+                    return payload['data']
+            except (OSError, ValueError, TypeError, KeyError):
+                pass
+        return None
+
+    def put(self, key, data):
+        with self.lock:
+            self.directory.mkdir(parents=True, exist_ok=True)
+            target = self.path(key)
+            temporary = target.with_suffix('.tmp')
+            temporary.write_text(json.dumps({'saved': time.time(), 'data': data}))
+            temporary.replace(target)
+
 class Client:
+    def __init__(self):
+        self.cache = JsonCache()
+        self.guard = threading.RLock()
+        self.host_locks = {}
+        self.next_request = {}
+        self.blocked = {}
+
     def get(self, url, params=None, headers=None):
         if params:
             url += '?' + urllib.parse.urlencode(params)
-        last_error = 'unknown provider failure'
+        parsed = urllib.parse.urlsplit(url)
+        host, endpoint = parsed.netloc, parsed.path
+        with self.guard:
+            lock = self.host_locks.setdefault(host, threading.RLock())
+        interval = 2.2 if host == 'api.coingecko.com' else 0.4
+        catalog = endpoint in ('/api/v3/exchangeInfo', '/0/public/AssetPairs',
+                               '/api/v5/public/instruments', '/api/v2/symbols')
+        cached = self.cache.get('catalog:' + url, 6 * 3600) if catalog else None
+        if cached is not None:
+            return cached
+        last_error = 'unknown provider failure' 
         for attempt in range(5):
             try:
-                request = urllib.request.Request(url, headers=headers or {})
-                with urllib.request.urlopen(request, timeout=30) as response:
-                    return json.load(response)
+                with lock:
+                    if endpoint in self.blocked:
+                        raise DataError(self.blocked[endpoint])
+                    # Recheck catalogue cache after another worker populated it.
+                    cached = self.cache.get('catalog:' + url, 6 * 3600) if catalog else None
+                    if cached is not None:
+                        return cached
+                    delay = self.next_request.get(host, 0) - time.monotonic()
+                    if delay > 0:
+                        time.sleep(delay)
+                    self.next_request[host] = time.monotonic() + interval
+                    request = urllib.request.Request(url, headers=headers or {})
+                    with urllib.request.urlopen(request, timeout=20) as response:
+                        result = json.load(response)
+                    valid_catalog = (isinstance(result, dict)
+                                     and not result.get('error')
+                                     and result.get('code', '0') in ('0', '200000')
+                                     and any(k in result for k in ('symbols', 'result', 'data')))
+                    if catalog and valid_catalog:
+                        self.cache.put('catalog:' + url, result)
+                    return result
             except urllib.error.HTTPError as exc:
+                if exc.code in (403, 451):
+                    with lock:
+                        self.blocked[endpoint] = f'HTTP {exc.code}: endpoint unavailable for this run'
                 if exc.code not in (429, 500, 502, 503, 504):
                     raise DataError(f'HTTP {exc.code} from data provider') from None
                 last_error = f'HTTP {exc.code}'
@@ -45,6 +114,8 @@ class Client:
                 last_error = ('Invalid JSON response' if isinstance(exc, json.JSONDecodeError)
                               else 'Network connection failure or timeout')
                 wait = 2 ** (attempt + 1)
+            with lock:
+                self.next_request[host] = max(self.next_request.get(host, 0), time.monotonic() + wait)
             if attempt < 4:
                 time.sleep(wait)
         raise DataError(f'Data provider unavailable after five attempts: {last_error}')
@@ -70,16 +141,16 @@ class Candle:
     volume: float
 
 def closed_candles(rows, now):
-    """Accept UTC 1D candles only; require contiguous, current, finite data."""
-    cutoff = int(now.timestamp()) // DAY * DAY
+    """Accept completed UTC 4H candles only; require contiguous, current, finite data."""
+    cutoff = int(now.timestamp()) // BAR * BAR
     unique = {}
     for row in rows:
         c = Candle(int(row[0]), *(float(x) for x in row[1:6]))
         if c.timestamp >= cutoff:
             continue
         values = (c.open, c.high, c.low, c.close, c.volume)
-        if c.timestamp % DAY or not all(math.isfinite(v) for v in values):
-            raise DataError('Invalid daily candle')
+        if c.timestamp % BAR or not all(math.isfinite(v) for v in values):
+            raise DataError('Invalid 4H candle')
         if min(values[:4]) <= 0 or c.volume < 0 or not (c.low <= min(c.open, c.close) <= max(c.open, c.close) <= c.high):
             raise DataError('Invalid OHLCV values')
         if c.timestamp in unique and unique[c.timestamp] != c:
@@ -87,11 +158,11 @@ def closed_candles(rows, now):
         unique[c.timestamp] = c
     candles = sorted(unique.values(), key=lambda c: c.timestamp)
     if len(candles) < 260:
-        raise DataError('Fewer than 260 completed daily candles')
-    if candles[-1].timestamp != cutoff - DAY:
-        raise DataError('Stale daily candles')
-    if any(b.timestamp - a.timestamp != DAY for a, b in zip(candles, candles[1:])):
-        raise DataError('Missing daily candles')
+        raise DataError('Fewer than 260 completed 4H candles')
+    if candles[-1].timestamp != cutoff - BAR:
+        raise DataError('Stale 4H candles')
+    if any(b.timestamp - a.timestamp != BAR for a, b in zip(candles, candles[1:])):
+        raise DataError('Missing 4H candles')
     if sum(c.volume for c in candles[-21:-1]) <= 0:
         raise DataError('No usable volume')
     return candles
@@ -102,31 +173,106 @@ class MarketData:
         key = os.getenv('COINGECKO_API_KEY')
         self.cg_headers = {'x-cg-demo-api-key': key} if key else {}
         self.last_cg = 0.0
+        self.cg_lock = threading.RLock()
+        self.cache = JsonCache()
+        self.excluded_stablecoins = 0
         self.binance_pairs = None
         self.kraken_pairs = None
         self.okx_pairs = None
         self.kucoin_pairs = None
 
     def cg(self, path, params):
-        delay = 2.2 - (time.monotonic() - self.last_cg)
-        if delay > 0:
-            time.sleep(delay)
-        self.last_cg = time.monotonic()
-        return self.client.get('https://api.coingecko.com/api/v3/' + path, params, self.cg_headers)
+        # Shared across workers: parallel scanning must not multiply CoinGecko rate.
+        with self.cg_lock:
+            delay = 2.2 - (time.monotonic() - self.last_cg)
+            if delay > 0:
+                time.sleep(delay)
+            self.last_cg = time.monotonic()
+            return self.client.get('https://api.coingecko.com/api/v3/' + path, params, self.cg_headers)
+
+    def stablecoin_ids(self):
+        categories = self.cg('coins/categories/list', {})
+        if not isinstance(categories, list):
+            raise DataError('CoinGecko category classification unavailable')
+        ids = {c['category_id'] for c in categories
+               if 'stablecoin' in c.get('category_id', '')
+               and not any(word in (c.get('category_id', '') + ' ' + c.get('name', '')).lower()
+                           for word in ('issuer', 'protocol', 'ecosystem', 'governance'))}
+        if 'stablecoins' not in ids:
+            raise DataError('Required stablecoin category missing; universe selection stopped')
+        stable = set()
+        for category in sorted(ids):
+            for page in range(1, 11):
+                rows = self.cg('coins/markets', {'vs_currency': 'usd', 'category': category,
+                               'order': 'market_cap_desc', 'per_page': 250, 'page': page})
+                if not isinstance(rows, list):
+                    raise DataError('Stablecoin category membership unavailable')
+                stable.update(c['id'] for c in rows)
+                if len(rows) < 250:
+                    break
+            else:
+                raise DataError('Stablecoin category pagination incomplete')
+        if not stable:
+            raise DataError('Empty stablecoin classification; universe selection stopped')
+        return stable
 
     def top100(self):
-        coins = self.cg('coins/markets', {'vs_currency': 'usd', 'order': 'market_cap_desc',
-                                         'per_page': 100, 'page': 1, 'sparkline': 'false'})
-        if not isinstance(coins, list) or len(coins) != 100:
-            raise DataError('CoinGecko did not return exactly 100 coins')
-        if len({c['id'] for c in coins}) != 100 or any(not c.get('market_cap') for c in coins):
-            raise DataError('Invalid CoinGecko universe')
-        return coins
+        stable = self.stablecoin_ids()
+        selected, seen = [], set()
+        for page in range(1, 11):
+            coins = self.cg('coins/markets', {'vs_currency': 'usd', 'order': 'market_cap_desc',
+                                             'per_page': 250, 'page': page, 'sparkline': 'false'})
+            if not isinstance(coins, list):
+                raise DataError('Invalid CoinGecko universe')
+            for c in coins:
+                if c['id'] in seen:
+                    continue
+                seen.add(c['id'])
+                if c['id'] in stable:
+                    self.excluded_stablecoins += 1
+                    continue
+                if not c.get('market_cap'):
+                    continue
+                selected.append(c)
+                if len(selected) == 100:
+                    return selected
+            if len(coins) < 250:
+                break
+        raise DataError('Fewer than 100 classified non-stablecoins available')
+
+    def tickers(self, coin):
+        key = 'tickers:' + coin['id']
+        cached = self.cache.get(key, 6 * 3600)
+        if isinstance(cached, list) and cached:
+            return cached
+        result = []
+        for page in range(1, 4):
+            batch = self.cg('coins/' + urllib.parse.quote(coin['id'], safe='') + '/tickers',
+                            {'order': 'volume_desc', 'page': page,
+                             'exchange_ids': 'binance,kraken,okex,kucoin'})['tickers']
+            result.extend(batch)
+            if len(batch) < 100:
+                break
+        # Do not persist empty results: allow temporary indexing gaps to recover.
+        if result:
+            self.cache.put(key, result)
+        return result
+
+    def history(self, exchange, base, quote):
+        key = f'candles:4h:{exchange}:{base}:{quote}'
+        rows = self.cache.get(key, 14 * DAY)
+        if not isinstance(rows, list) or not rows:
+            return []
+        try:
+            previous_cutoff = max(int(r[0]) for r in rows) + BAR
+            closed_candles(rows, datetime.fromtimestamp(previous_cutoff, UTC))
+            return rows
+        except (DataError, ValueError, TypeError, IndexError):
+            return []
 
     def candles(self, coin, now):
         # CoinGecko coin-ID tickers identify the asset; never guess from its symbol.
-        tickers = self.cg('coins/' + urllib.parse.quote(coin['id'], safe='') + '/tickers',
-                          {'order': 'volume_desc', 'page': 1, 'exchange_ids': 'binance,kraken,okex,kucoin'})['tickers']
+        tickers = self.tickers(coin)
         candidates = [t for t in tickers if t.get('coin_id') == coin['id']
                       and not t.get('is_anomaly') and not t.get('is_stale')
                       and t['market']['identifier'] in ('binance', 'kraken', 'okex', 'kucoin')
@@ -142,6 +288,8 @@ class MarketData:
             try:
                 exchange = t['market']['identifier']
                 base, quote = t['base'], t['target']
+                cached_rows = self.history(exchange, base, quote)
+                since = max(int(r[0]) for r in cached_rows) - 2 * BAR if cached_rows else None
                 if exchange == 'binance':
                     if self.binance_pairs is None:
                         info = self.client.get('https://api.binance.com/api/v3/exchangeInfo')
@@ -151,8 +299,10 @@ class MarketData:
                     pair = self.binance_pairs.get((base, quote))
                     if not pair:
                         raise DataError('Market absent from active spot catalogue')
-                    raw = self.client.get('https://api.binance.com/api/v3/klines',
-                                          {'symbol': pair, 'interval': '1d', 'limit': 400})
+                    params = {'symbol': pair, 'interval': '4h', 'limit': 400}
+                    if since is not None:
+                        params['startTime'] = since * 1000
+                    raw = self.client.get('https://api.binance.com/api/v3/klines', params)
                     rows = [[int(r[0]) // 1000, *r[1:6]] for r in raw]
                 elif exchange == 'kraken':
                     if self.kraken_pairs is None:
@@ -164,8 +314,10 @@ class MarketData:
                     pair = self.kraken_pairs.get(f'{aliases.get(base, base)}/{quote}')
                     if not pair:
                         raise DataError('Market absent from active spot catalogue')
-                    raw = self.client.get('https://api.kraken.com/0/public/OHLC',
-                                          {'pair': pair, 'interval': 1440})
+                    params = {'pair': pair, 'interval': 240}
+                    if since is not None:
+                        params['since'] = since
+                    raw = self.client.get('https://api.kraken.com/0/public/OHLC', params)
                     if raw.get('error'):
                         raise DataError('Kraken OHLC request failed')
                     series = [v for k, v in raw['result'].items() if k != 'last']
@@ -183,7 +335,7 @@ class MarketData:
                     rows = []
                     cursor = None
                     for _ in range(5):
-                        params = {'instId': pair, 'bar': '1Dutc', 'limit': 100}
+                        params = {'instId': pair, 'bar': '4H', 'limit': 100}
                         if cursor is not None:
                             params['after'] = cursor
                         raw = self.client.get('https://www.okx.com/api/v5/market/history-candles', params)
@@ -198,7 +350,7 @@ class MarketData:
                         if cursor is not None and oldest >= cursor:
                             raise DataError('OKX pagination did not advance')
                         cursor = oldest
-                        if len(rows) >= 400:
+                        if (since is not None and oldest // 1000 <= since) or len(rows) >= 400:
                             break
                 elif exchange == 'kucoin':
                     if self.kucoin_pairs is None:
@@ -210,19 +362,24 @@ class MarketData:
                     pair = self.kucoin_pairs.get((base, quote))
                     if not pair:
                         raise DataError('Market absent from active spot catalogue')
-                    end = int(now.timestamp()) // DAY * DAY
+                    end = int(now.timestamp()) // BAR * BAR
                     raw = self.client.get('https://api.kucoin.com/api/v1/market/candles',
-                                          {'symbol': pair, 'type': '1day', 'startAt': end-401*DAY,
+                                          {'symbol': pair, 'type': '4hour', 'startAt': since if since is not None else end-401*BAR,
                                            'endAt': end})
                     if raw.get('code') != '200000':
                         raise DataError('KuCoin historical candles rejected request')
                     # KuCoin uses [time, open, close, high, low, volume, turnover].
                     rows = [[int(r[0]), r[1], r[3], r[4], r[2], r[5]] for r in raw['data']]
-                return closed_candles(rows, now), f'{exchange}:{pair}'
+                merged = {int(r[0]): r for r in cached_rows}
+                merged.update({int(r[0]): r for r in rows})
+                candles = closed_candles(list(merged.values()), now)[-500:]
+                self.cache.put(f'candles:4h:{exchange}:{base}:{quote}',
+                               [[c.timestamp, c.open, c.high, c.low, c.close, c.volume] for c in candles])
+                return candles, f'{exchange}:{pair}'
             except (DataError, KeyError, IndexError, TypeError, ValueError) as exc:
                 detail = str(exc) if isinstance(exc, DataError) else 'Malformed provider response: ' + type(exc).__name__
                 errors.append(f'{exchange}:{base}/{quote}: {detail}')
-        raise DataError('No verified USD/USDT/USDC market with valid 1D history' +
+        raise DataError('No verified USD/USDT/USDC market with valid 4H history' +
                         (f' ({"; ".join(errors)})' if errors else ': no verified non-stale CoinGecko ticker on supported exchanges'))
 
 def ema(values, period):
@@ -289,10 +446,8 @@ def strong_signals(candles):
     return [s for d in ('LONG', 'SHORT') if (s := score(candles, d))['eligible'] and s['score'] >= THRESHOLD]
 
 def scheduled_slot(schedule, now):
-    local = now.astimezone(ZoneInfo('Europe/Zurich'))
-    # Use cron identity, not runner wall-clock hour: GitHub may start jobs late.
-    expected = '0 6 * * *' if local.utcoffset() == timedelta(hours=2) else '0 7 * * *'
-    return schedule == expected
+    return schedule == '1 */4 * * *'
+
 
 class StateStore:
     def __init__(self, client):
@@ -329,12 +484,16 @@ class StateStore:
 
 def reserve(state, coin_id, signals, candle):
     """Notify only when a strong directional episode starts, once per closed day."""
-    old = state['coins'].get(coin_id, {'candle': 0, 'active': []})
+    key = f'{TIMEFRAME}:{coin_id}'
+    old = state['coins'].get(key)
+    if old is None:
+        legacy = state['coins'].get(coin_id, {})
+        old = {'candle': legacy.get('candle', 0), 'active': legacy.get('active', [])}
     if candle <= old['candle']:
         return []
     active = [s['direction'] for s in signals]
     new = [s for s in signals if s['direction'] not in old['active']]
-    state['coins'][coin_id] = {'candle': candle, 'active': active}
+    state['coins'][key] = {'candle': candle, 'active': active}
     return new
 
 
@@ -354,10 +513,10 @@ def telegram(client, token, chat, message):
 
 
 def message(coin, signal, source):
-    date = datetime.fromtimestamp(signal['candle'], UTC).date()
+    date = datetime.fromtimestamp(signal['candle'], UTC).strftime('%Y-%m-%d %H:%M UTC')
     reasons = ', '.join(f'{k}={v}' for k, v in signal['components'].items())
     return (f"{coin['name']} ({coin['symbol'].upper()}) {signal['direction']} {signal['score']}/100\n"
-            f"Abgeschlossene UTC-Tageskerze: {date} | {source}\n"
+            f"Abgeschlossene 4H-Kerze (Beginn): {date} | {source}\n"
             f"Setup: {signal['setup']} | Schluss: {signal['close']:.8g}\n"
             f"Liquiditätszone: {signal['liquidity_level']:.8g} | Stop-Referenz: {signal['stop_reference']:.8g}\n"
             f"Volumenfaktor: {signal['volume_ratio']}\n{reasons}\n"
@@ -367,7 +526,7 @@ def message(coin, signal, source):
 def run(dry_run=False):
     client = Client()
     now = datetime.now(UTC)
-    report = {'started_at': now.isoformat(), 'dry_run': dry_run, 'universe_count': 0,
+    report = {'started_at': now.isoformat(), 'timeframe': TIMEFRAME, 'dry_run': dry_run, 'universe_count': 0,
               'analyzed_count': 0, 'data_gaps': [], 'new_strong_signals': [], 'sent': 0}
     store = None
     state = {'version': 1, 'coins': {}}
@@ -381,16 +540,35 @@ def run(dry_run=False):
         coins = data.top100()
         report['universe_count'] = len(coins)
         notices = []
-        for coin in coins:
-            try:
-                candles, source = data.candles(coin, now)
+        report['excluded_stablecoins'] = data.excluded_stablecoins
+        report['sources'] = {}
+        def analyze(coin):
+            error = None
+            for attempt in range(3):
+                try:
+                    candles, source = data.candles(coin, now)
+                    return coin, candles, source, None
+                except (DataError, KeyError, ValueError, TypeError, IndexError) as exc:
+                    error = str(exc) if isinstance(exc, DataError) else type(exc).__name__
+                    # Exchange publication can lag the close; retry freshness only.
+                    if 'Stale 4H candles' not in error or attempt == 2:
+                        break
+                    time.sleep(15)
+            return coin, None, None, error
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = [pool.submit(analyze, coin) for coin in coins]
+            for future in as_completed(futures):
+                coin, candles, source, error = future.result()
+                if error:
+                    report['data_gaps'].append({'coin_id': coin['id'], 'reason': error})
+                    continue
                 signals = strong_signals(candles)
                 report['analyzed_count'] += 1
+                venue = source.split(':')[0]
+                report['sources'][venue] = report['sources'].get(venue, 0) + 1
                 for signal in reserve(state, coin['id'], signals, candles[-1].timestamp):
                     report['new_strong_signals'].append({'coin_id': coin['id'], 'source': source, **signal})
                     notices.append(message(coin, signal, source))
-            except (DataError, KeyError, ValueError, TypeError) as exc:
-                report['data_gaps'].append({'coin_id': coin['id'], 'reason': str(exc)})
         if report['analyzed_count'] < 50:
             raise DataError('Less than 50/100 assets analyzable; degraded scan, no notifications')
         if store:
@@ -405,6 +583,8 @@ def run(dry_run=False):
         report['status'] = 'failed'
         report['error'] = str(exc) if isinstance(exc, DataError) else type(exc).__name__
     finally:
+        report['finished_at'] = datetime.now(UTC).isoformat()
+        report['duration_seconds'] = round((datetime.now(UTC) - now).total_seconds(), 2)
         Path('reports').mkdir(exist_ok=True)
         Path('reports/latest.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
     print(json.dumps({k: report[k] for k in ('status', 'universe_count', 'analyzed_count', 'sent')}))
