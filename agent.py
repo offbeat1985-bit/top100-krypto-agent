@@ -442,8 +442,14 @@ def score(candles, direction):
             'setup': 'retest' if retest else 'breakout', 'candle': last.timestamp,
             'ema': {str(p): averages[p][-1] for p in averages}}
 
-def strong_signals(candles):
-    return [s for d in ('LONG', 'SHORT') if (s := score(candles, d))['eligible'] and s['score'] >= THRESHOLD]
+def candidate_scores(candles):
+    """Archive both directions, even weak/ineligible scores; no notification here."""
+    return [score(candles, direction) for direction in ('LONG', 'SHORT')]
+
+
+def strong_signals(candles, evaluations=None):
+    evaluated = candidate_scores(candles) if evaluations is None else evaluations
+    return [s for s in evaluated if s['eligible'] and s['score'] >= THRESHOLD]
 
 def scheduled_slot(schedule, now):
     return schedule == '1 */4 * * *'
@@ -527,7 +533,11 @@ def run(dry_run=False):
     client = Client()
     now = datetime.now(UTC)
     report = {'started_at': now.isoformat(), 'timeframe': TIMEFRAME, 'dry_run': dry_run, 'universe_count': 0,
-              'analyzed_count': 0, 'data_gaps': [], 'new_strong_signals': [], 'sent': 0}
+              'analyzed_count': 0, 'data_gaps': [], 'new_strong_signals': [], 'sent': 0,
+              'candidate_scores': [], 'confirmed_deliveries': [], 'report_version': 2,
+              'strategy_commit': os.getenv('GITHUB_SHA'),
+              'component_maxima': {'ema_alignment': 20, 'ema_slope': 10, 'structure': 20,
+                                   'volume': 15, 'breakout': 20, 'retest': 10, 'liquidity_risk': 5}}
     store = None
     state = {'version': 1, 'coins': {}}
     try:
@@ -539,6 +549,8 @@ def run(dry_run=False):
         data = MarketData(client)
         coins = data.top100()
         report['universe_count'] = len(coins)
+        report['universe'] = [{'coin_id': c['id'], 'market_cap_rank': c.get('market_cap_rank'),
+                               'market_cap': c.get('market_cap')} for c in coins]
         notices = []
         report['excluded_stablecoins'] = data.excluded_stablecoins
         report['sources'] = {}
@@ -562,21 +574,39 @@ def run(dry_run=False):
                 if error:
                     report['data_gaps'].append({'coin_id': coin['id'], 'reason': error})
                     continue
-                signals = strong_signals(candles)
+                evaluated = candidate_scores(candles)
+                evaluated_at = datetime.now(UTC).isoformat()
+                for candidate in evaluated:
+                    report['candidate_scores'].append({
+                        'signal_id': f"4h:{coin['id']}:{candles[-1].timestamp}:{candidate['direction']}",
+                        'coin_id': coin['id'], 'source': source, 'evaluated_at': evaluated_at,
+                        'candle_closed_at': datetime.fromtimestamp(candles[-1].timestamp + BAR, UTC).isoformat(),
+                        'price_reference': 'closed_candle_only_not_an_execution_price', **candidate})
+                signals = strong_signals(candles, evaluations=evaluated)
                 report['analyzed_count'] += 1
                 venue = source.split(':')[0]
                 report['sources'][venue] = report['sources'].get(venue, 0) + 1
                 for signal in reserve(state, coin['id'], signals, candles[-1].timestamp):
-                    report['new_strong_signals'].append({'coin_id': coin['id'], 'source': source, **signal})
+                    report['new_strong_signals'].append({'coin_id': coin['id'], 'source': source,
+                        'signal_id': f"4h:{coin['id']}:{candles[-1].timestamp}:{signal['direction']}", **signal})
                     notices.append(message(coin, signal, source))
         if report['analyzed_count'] < 50:
             raise DataError('Less than 50/100 assets analyzable; degraded scan, no notifications')
         if store:
             # Reserve the complete batch durably BEFORE contacting Telegram.
             store.save(state)
-            for notice in notices:
-                telegram(client, os.environ['TELEGRAM_BOT_TOKEN'], os.environ['TELEGRAM_CHAT_ID'], notice)
+            for i, notice in enumerate(notices):
+                attempted_at = datetime.now(UTC).isoformat()
+                try:
+                    telegram(client, os.environ['TELEGRAM_BOT_TOKEN'], os.environ['TELEGRAM_CHAT_ID'], notice)
+                except DataError:
+                    report['uncertain_delivery'] = {'signal_id': report['new_strong_signals'][i]['signal_id'],
+                                                    'attempted_at': attempted_at}
+                    raise
                 report['sent'] += 1
+                report['confirmed_deliveries'].append({
+                    'signal_id': report['new_strong_signals'][i]['signal_id'],
+                    'attempted_at': attempted_at, 'api_confirmed_at': datetime.now(UTC).isoformat()})
         report['status'] = 'partial' if report['data_gaps'] else 'complete'
     except Exception as exc:
         # Unexpected exception messages may contain request URLs; do not print them.
