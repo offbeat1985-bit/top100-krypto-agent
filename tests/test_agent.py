@@ -187,7 +187,7 @@ class Pipeline(CachedTestCase):
                 os.chdir(directory)
                 with patch.dict(os.environ,{'TELEGRAM_BOT_TOKEN':'test-secret','TELEGRAM_CHAT_ID':'test-chat'}), \
                      patch('agent.StateStore',return_value=store), patch('agent.MarketData',return_value=data), \
-                     patch('agent.strong_signals',return_value=[signal]), patch('agent.message',return_value='strong signal'), \
+                     patch('agent.candidate_scores',return_value=[signal]), patch('agent.strong_signals',return_value=[signal]), patch('agent.message',return_value='strong signal'), \
                      patch('agent.telegram',side_effect=send), patch('builtins.print'):
                     result=agent.run(dry)
                 report=json.loads(Path('reports/latest.json').read_text())
